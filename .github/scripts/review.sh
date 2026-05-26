@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ─── Config ───────────────────────────────────────────────────────────────
-MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
+MODEL="${CLAUDE_MODEL:-claude-opus-4-7}"
 API_URL="https://api.anthropic.com/v1/messages"
 MAX_TOKENS=4096
 CHECKLIST='## Review Checklist
