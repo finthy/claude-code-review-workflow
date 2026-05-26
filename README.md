@@ -1,48 +1,19 @@
-# Claude 自动 Code Review 部署指南
+# Claude 自动 Code Review
 
-## 效果
+> 往 PR 推代码 → 自动审查 → 结果贴到 PR 页面对应行。跟人 review 一样精准。
 
-每次往任意 PR 推送代码，GitHub Actions 自动触发 Claude 进行深度代码审查，审查结果以 **行级评论 + 总结** 的形式贴在 PR 页面上。
+## 部署（2 分钟）
 
-> 审查方法论基于 [gstack](https://github.com/garrytan/gstack) 两轮审查：第一轮查严重问题（SQL 安全、竞态条件、注入），第二轮查代码质量（错误处理、死代码、性能）。
+### 1. 拿到 API Key
+打开 https://console.anthropic.com/keys → Create Key → 复制
 
----
+### 2. 配 Secret
+仓库 → Settings → Secrets and variables → Actions → New secret
+- Name: `ANTHROPIC_API_KEY`
+- Value: 刚复制的 key
 
-## 部署步骤（5 分钟）
-
-### 第一步：获取 Anthropic API Key
-
-1. 打开 https://console.anthropic.com/keys
-2. 登录或注册 Anthropic 账号（新用户有免费额度）
-3. 点击 **Create Key**，复制生成的 key
-
-### 第二步：给仓库加 Secret
-
-1. 打开目标 GitHub 仓库 → **Settings** → **Secrets and variables** → **Actions**
-2. 点击 **New repository secret**
-   - Name 填：`ANTHROPIC_API_KEY`
-   - Value 填：第一步复制的 key
-3. 点 **Add secret** 保存
-
-### 第三步：把工作流文件放进仓库
-
-方式一（推荐）：直接复制模板仓库的文件。
-
-```bash
-# Clone 模板
-git clone https://github.com/finthy/claude-code-review-workflow.git
-
-# 把 .github 文件夹拷贝到你的项目根目录
-cp -r claude-code-review-workflow/.github /你的项目路径/
-
-# 提交推送
-cd /你的项目路径
-git add .github/
-git commit -m "Add Claude automated code review"
-git push
-```
-
-方式二：手动在项目根目录创建以下两个文件。
+### 3. 放文件
+把下面两个文件放进仓库根目录
 
 **`.github/workflows/claude-review.yml`**
 
@@ -52,6 +23,10 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize]
+    paths-ignore:
+      - '*.lock' '*.json' '*.md' '*.txt' '*.yml' '*.yaml'
+      - '*.svg' '*.png' '*.jpg' '*.gif' '*.ico' '*.woff*'
+      - 'dist/**' 'build/**' 'node_modules/**' '.github/**'
 
 permissions:
   pull-requests: write
@@ -62,18 +37,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Run Claude Code Review
-        env:
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm install -g @anthropic-ai/claude-code
+      - env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ github.token }}
-          CLAUDE_MODEL: claude-sonnet-4-6
-        run: |
-          bash .github/scripts/review.sh
+          CLAUDE_MODEL: claude-opus-4-7
+        run: bash .github/scripts/review.sh
 ```
 
 **`.github/scripts/review.sh`**
@@ -82,280 +58,127 @@ jobs:
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
-API_URL="https://api.anthropic.com/v1/messages"
-MAX_TOKENS=4096
-CHECKLIST='## Review Checklist
-
-### Pass 1 — CRITICAL (blocking)
-
-**SQL & Data Safety**
-- String interpolation in SQL — use parameterized queries
-- TOCTOU races: check-then-set without atomic ops
-- N+1 queries: missing eager loading in loops
-- Missing transaction boundaries around multi-step mutations
-
-**Race Conditions & Concurrency**
-- Read-check-write without uniqueness constraint
-- Find-or-create on columns without unique index
-- Status transitions without atomic compare-and-swap
-- Shared mutable state without synchronization
-
-**Injection & Trust Boundaries**
-- User data passed to eval/exec/system/template without sanitization
-- Missing auth/authz checks on new endpoints
-- Hardcoded secrets, credentials, or API keys
-
-### Pass 2 — INFORMATIONAL (non-blocking)
-
-**Error Handling**
-- Swallowed errors (caught but not logged/handled)
-- Missing error checks on I/O, network, type assertions
-- Missing cleanup/rollback on partial failure
-
-**Dead Code & Consistency**
-- Variables assigned but never read
-- Comments describing old behavior
-
-**Test Gaps**
-- Security features without integration tests
-- Missing negative-path tests
-
-**Performance**
-- N+1 queries or unbounded DB fetches
-- Expensive ops inside loops
-- Missing pagination on list endpoints
-
-**API Contracts**
-- Breaking changes without versioning
-- Request/response schema mismatches'
+MODEL="${CLAUDE_MODEL:-claude-opus-4-7}"
 REPO="${GITHUB_REPOSITORY:-}"
 PR_NUMBER="${PR_NUMBER:-}"
-GH_TOKEN="${GH_TOKEN:-}"
+BASE_REF="${BASE_REF:-main}"
+HEAD_SHA="${HEAD_SHA:-}"
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-  echo "ERROR: ANTHROPIC_API_KEY not set"
+if [[ -z "${ANTHROPIC_API_KEY:-}" || -z "$REPO" || -z "$PR_NUMBER" ]]; then
+  echo "ERROR: missing required env vars"
   exit 1
 fi
 
-if [[ -z "$REPO" || -z "$PR_NUMBER" ]]; then
-  echo "ERROR: GITHUB_REPOSITORY or PR_NUMBER not set"
-  exit 1
-fi
+echo "[*] Reviewing ${REPO}#${PR_NUMBER} [gstack | ${MODEL}]"
 
-echo "[*] Reviewing ${REPO}#${PR_NUMBER}"
-echo "[*] Fetching PR diff..."
+CHECKLIST='## Review Checklist (gstack two-pass)
 
-DIFF="$(gh pr diff "$PR_NUMBER" --repo "$REPO" 2>/dev/null)" || {
-  echo "ERROR: Cannot get diff for PR #${PR_NUMBER}"
-  exit 1
-}
+### Pass 1 — CRITICAL (blocking)
+**SQL & Data Safety** — String interpolation in SQL, TOCTOU races, N+1 queries, missing transactions
+**Race Conditions** — Read-check-write without uniqueness, find-or-create without unique index, atomic status transitions
+**Injection & Trust** — Unsanitized input to eval/exec/template, missing auth/authz, hardcoded secrets
 
-if [[ -z "$DIFF" ]]; then
-  echo "[*] Empty diff — nothing to review."
-  exit 0
-fi
+### Pass 2 — INFORMATIONAL (non-blocking)
+**Conditional Side Effects** — Side effects forgotten on one branch
+**Dead Code** — Variables assigned but never read, stale comments
+**Error Handling** — Swallowed errors, missing cleanup/rollback
+**Test Gaps** — Security features without tests, missing negative-path tests
+**Performance** — N+1 queries, expensive ops in loops, missing pagination
+**API Contracts** — Breaking changes without versioning, schema mismatches
+**Crypto** — Non-crypto RNG for security values, non-constant-time comparison
+**Type Coercion** — Values crossing serialization boundaries where type could change
 
-HEAD_SHA="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid' 2>/dev/null)"
-DIFF_LENGTH=${#DIFF}
-echo "[*] Diff: ${DIFF_LENGTH} chars"
+### Suppressions: NO style nits, NO naming conventions, NO "add a comment", NO formatting changes'
 
-read -r -d '' SYSTEM_PROMPT <<'SYSEOF' || true
-You are an expert code reviewer performing a pre-landing review. Follow the review checklist provided by the user. Use the gstack two-pass methodology:
+prompt=$(cat <<PROMPT
+You are an expert code reviewer. Perform a two-pass pre-landing review using the gstack methodology.
 
-- Pass 1: CRITICAL issues (SQL safety, race conditions, injection, auth) — these are BLOCKING.
-- Pass 2: INFORMATIONAL issues (error handling, dead code, test gaps, performance, API contracts) — non-blocking.
-
-Rules:
-- Be TERSER. One line for problem, one line for fix.
-- Do NOT flag issues already addressed in the diff.
-- Do NOT flag style preferences, naming nits, or formatting.
-- Only flag REAL problems. Skip anything that's fine.
-- For each issue, provide exact file path and line number (the NEW line number in the diff).
-
-You MUST respond with a JSON object (no markdown, no backticks, raw JSON only):
-
-{
-  "verdict": "request_changes" or "comment" or "approve",
-  "summary": "one-line verdict summary",
-  "issues": [
-    {
-      "path": "src/file.ts",
-      "line": 42,
-      "severity": "critical" or "info",
-      "problem": "one line describing the problem",
-      "fix": "suggested fix"
-    }
-  ]
-}
-
-If no issues found, return: {"verdict":"approve","summary":"No issues found. LGTM","issues":[]}
-
-Important:
-- "request_changes" verdict if ANY critical issue exists.
-- "comment" verdict if only informational issues.
-- "approve" only if zero issues.
-- Line numbers must be from the NEW file (lines starting with + or context lines in the diff).
-- ONLY flag issues in files/lines that appear in the diff.
-SYSEOF
-
-USER_MESSAGE="## PR Diff (${REPO}#${PR_NUMBER})
-
-\`\`\`diff
-${DIFF}
-\`\`\`
+## Repository: ${REPO} | PR #${PR_NUMBER} | Head: ${HEAD_SHA}
 
 ${CHECKLIST}
 
-Review this PR diff. Output raw JSON only."
+## Rules
+- Read the FULL diff first. Do NOT flag issues already addressed.
+- Use Read/Grep/Glob to explore source files for context — avoid false positives.
+- ONLY flag issues in files and lines in the diff.
+- Be terse: one line problem, one line fix. No preamble.
+- Respect suppressions.
 
-echo "[*] Sending to Claude (model: ${MODEL})..."
+## Steps
 
-SYSTEM_PROMPT_ESCAPED="$(echo "$SYSTEM_PROMPT" | jq -Rs .)"
-USER_MESSAGE_ESCAPED="$(echo "$USER_MESSAGE" | jq -Rs .)"
+### 1. Get the diff
+\`\`\`
+git fetch origin ${BASE_REF} --quiet 2>/dev/null
+git diff origin/${BASE_REF} -- . ':!package-lock.json' ':!*.lock' ':!dist/**' ':!build/**'
+\`\`\`
 
-BODY="$(cat <<BOD
-{
-  "model": "${MODEL}",
-  "max_tokens": ${MAX_TOKENS},
-  "system": ${SYSTEM_PROMPT_ESCAPED},
-  "messages": [
-    {"role": "user", "content": ${USER_MESSAGE_ESCAPED}}
-  ]
-}
-BOD
-)"
+### 2. Read source files for context
+For any suspicious change, use Read to see the full file. Check callers/callees, error paths, concurrency patterns.
 
-RESPONSE="$(curl -s -X POST "$API_URL" \
-  -H "x-api-key: ${ANTHROPIC_API_KEY}" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "content-type: application/json" \
-  -d "$BODY" 2>/dev/null)" || {
-  echo "ERROR: API call failed"
-  exit 1
-}
+### 3. Two-pass review
+Pass 1 — CRITICAL (SQL, race, injection). Pass 2 — INFORMATIONAL (everything else).
 
-if echo "$RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
-  echo "ERROR: API error — $(echo "$RESPONSE" | jq -r '.error.message')"
-  exit 1
-fi
+### 4. Post inline comments on exact lines
+For EVERY issue, run:
+\`\`\`
+gh api repos/${REPO}/pulls/${PR_NUMBER}/comments \
+  -f body="**[CRITICAL]** or **[INFO]**: <problem>"$'\\n'$"Fix: <fix>" \
+  -f commit_id="${HEAD_SHA}" \
+  -f path="<file_path>" \
+  -f line=<line_number>
+\`\`\`
 
-REVIEW_JSON="$(echo "$RESPONSE" | jq -r '.content[0].text // empty' 2>/dev/null)"
+### 5. Post summary
+\`\`\`
+gh api repos/${REPO}/issues/${PR_NUMBER}/comments -f body="<summary>"
+\`\`\`
+Start with **Request changes** (any CRITICAL), **Approve with comments** (only INFO), or **LGTM** (no issues).
+Format: \`Review: N issues (X critical, Y informational)\` then bullet list with [file:line].
+PROMPT
+)
 
-if [[ -z "$REVIEW_JSON" ]]; then
-  echo "ERROR: Empty response from Claude"
-  echo "Raw: $RESPONSE" | head -c 500
-  exit 1
-fi
-
-echo "[*] Review received: $(echo "$REVIEW_JSON" | head -c 200)"
-
-VERDICT="$(echo "$REVIEW_JSON" | jq -r '.verdict // empty' 2>/dev/null)"
-if [[ -z "$VERDICT" ]]; then
-  echo "ERROR: Cannot parse review JSON"
-  echo "Response: $REVIEW_JSON" | head -c 1000
-  exit 1
-fi
-
-SUMMARY="$(echo "$REVIEW_JSON" | jq -r '.summary // ""' 2>/dev/null)"
-ISSUE_COUNT="$(echo "$REVIEW_JSON" | jq -r '.issues | length' 2>/dev/null)"
-echo "[*] Verdict: ${VERDICT}, Issues: ${ISSUE_COUNT}"
-
-if [[ "$VERDICT" == "approve" && "$ISSUE_COUNT" == "0" ]]; then
-  echo "[*] No issues found. Posting approval comment."
-  gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "$(cat <<EOF
-## Claude Code Review
-
-${SUMMARY}
-EOF
-)" 2>/dev/null || echo "[!] Could not post review"
-  echo "[+] Done."
-  exit 0
-fi
-
-case "$VERDICT" in
-  request_changes) EVENT="REQUEST_CHANGES" ;;
-  approve)         EVENT="APPROVE" ;;
-  *)               EVENT="COMMENT" ;;
-esac
-
-echo "[*] Posting review with ${ISSUE_COUNT} inline comments..."
-
-REVIEW_BODY="## Claude Code Review
-
-**${SUMMARY}**
-
-| Severity | Count |
-|----------|-------|
-"
-
-CRITICAL_COUNT="$(echo "$REVIEW_JSON" | jq -r '[.issues[] | select(.severity == "critical")] | length' 2>/dev/null)"
-INFO_COUNT="$(echo "$REVIEW_JSON" | jq -r '[.issues[] | select(.severity == "info")] | length' 2>/dev/null)"
-REVIEW_BODY="${REVIEW_BODY}| Critical | ${CRITICAL_COUNT} |
-| Info | ${INFO_COUNT} |
-"
-
-COMMENTS_JSON="$(echo "$REVIEW_JSON" | jq -c '[.issues[] | {
-  path: .path,
-  line: .line,
-  body: ("**\(.severity | ascii_upcase)** \(.problem)\n\nFix: \(.fix)")
-}]' 2>/dev/null)"
-
-if [[ -z "$COMMENTS_JSON" || "$COMMENTS_JSON" == "[]" ]]; then
-  gh pr review "$PR_NUMBER" --repo "$REPO" "--${EVENT,,}" --body "$REVIEW_BODY" 2>/dev/null || {
-    gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$REVIEW_BODY" 2>/dev/null || echo "[!] Failed."
-  }
-else
-  gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
-    -f body="$REVIEW_BODY" \
-    -f event="$EVENT" \
-    -f comments="$COMMENTS_JSON" 2>/dev/null || {
-    gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$REVIEW_BODY" 2>/dev/null || echo "[!] Failed."
-  }
-fi
-
-echo "[+] Review posted: ${VERDICT} — ${ISSUE_COUNT} issues"
+echo "[*] Running Claude (${#prompt} chars)..."
+echo "$prompt" | claude -p --model "$MODEL" --max-budget-usd 5 \
+  --allowedTools "Bash(gh:*)" "Bash(git:*)" "Bash(jq:*)" "Read" "Grep" "Glob" 2>&1
 ```
 
----
+### 4. Push
 
-## 验证
+```bash
+git add .github/
+git commit -m "Add Claude automated code review"
+git push
+```
 
-1. 在仓库创建一个 PR
-2. 打开 GitHub Actions 页面，应该看到 `Claude Code Review` 正在运行
-3. 等待约 30 秒～2 分钟（取决于 diff 大小）
-4. PR 页面会出现 Claude 的审查评论
+## 效果
 
----
+```
+PR 页面 ↓
+
+┌─ Files changed ──────────────────────────────┐
+│ src/auth.ts:42                               │
+│ └ 💬 [CRITICAL] Missing error handling...    │  ← inline comment
+│ src/api.ts:88                                │
+│ └ 💬 [INFO] N+1 query in loop...             │  ← inline comment
+├─ Conversation ───────────────────────────────┤
+│ 🤖 Claude Code Review                        │
+│    Review: 3 issues (1 critical, 2 info)     │  ← 总结
+└──────────────────────────────────────────────┘
+```
 
 ## 自定义
 
-| 需求 | 怎么做 |
-|------|--------|
-| 换模型 | 改 workflow 里的 `CLAUDE_MODEL`（`claude-opus-4-7` 更深入，`claude-haiku-4-5` 更快） |
-| 改审查规则 | 编辑 `review.sh` 里的 `CHECKLIST` 变量 |
-| 调低门槛只想看严重 bug | 改 System Prompt，要求只输出 CRITICAL |
-| 大 PR 跳过不审 | 在 workflow 里加 `if: github.event.pull_request.changed_files < 100` |
-| 只审某类文件 | 在 workflow 里加 `paths` 过滤，例如 `paths: ['src/**']` |
-
----
+| 改什么 | 改哪里 |
+|--------|--------|
+| 换模型（Opus→Sonnet 更快） | workflow 里 `CLAUDE_MODEL: claude-sonnet-4-6` |
+| 只审特定语言 | workflow `paths-ignore` 换成 `paths: ['src/**.ts']` |
+| 调审查严格度 | 编辑 `CHECKLIST`，增删审查类别 |
+| 大 PR 跳过 | workflow 加 `if: github.event.pull_request.changed_files < 100` |
 
 ## 常见问题
 
-**Q: 花费多少？**  
-Sonnet 一次 review 约 $0.01～0.10，取决于 diff 大小。Hancu 更便宜。新用户有免费额度。
+**要钱吗？** 一次 review 约 $0.05～0.50，新用户有免费额度。
 
-**Q: 会不会重复审查？**  
-不会。只有 PR 新建（opened）和推送新代码（synchronize）时触发。
+**重复评论？** 每次 push 都会重新审。如果 Claude 找到之前说过的问题会再提一次，所以尽量修复后再 push。
 
-**Q: API key 安全吗？**  
-存在 GitHub Secrets 里，Actions 日志中不会打印出来，其他人看不到。
-
-**Q: 失败了怎么办？**  
-GitHub Actions 页面会显示失败日志，通常是 API key 过期或网络问题。
-
----
-
-## 模板仓库
-
-https://github.com/finthy/claude-code-review-workflow
+**token 安全吗？** Key 存在 GitHub Secrets 里，日志不会打印，外部不可见。
