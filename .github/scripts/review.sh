@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL="${CLAUDE_MODEL:-claude-opus-4-7}"
+MODEL="${CLAUDE_MODEL:-deepseek-v4-pro[1m]}"
 REPO="${GITHUB_REPOSITORY:-}"
 PR_NUMBER="${PR_NUMBER:-}"
 BASE_REF="${BASE_REF:-main}"

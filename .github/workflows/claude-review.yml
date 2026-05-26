@@ -48,7 +48,8 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ github.token }}
-          CLAUDE_MODEL: claude-opus-4-7
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          CLAUDE_MODEL: deepseek-v4-pro[1m]
           MAX_BUDGET: '5'
         run: |
           bash .github/scripts/review.sh
